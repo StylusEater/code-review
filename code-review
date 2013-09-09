@@ -1,0 +1,252 @@
+#!/usr/bin/env perl
+use 5.18.0;
+use warnings;
+
+use DateTime;
+use Getopt::Long::Descriptive;
+use List::AllUtils qw(uniq);
+use LWP::UserAgent;
+use MetaCPAN::API;
+use Parse::CPAN::Packages::Fast;
+use YAML::XS ();
+
+my ($opt, $usage) = describe_options(
+  '%c %o',
+  [ 'rebuild'      => "rebuild the YAML file that holds state" ],
+  [ 'project|p=s'  => "project to mark reviewed"               ],
+  [ 'message|m=s'  => "commit message"                         ],
+  [ 'pauseid=s'    => "your PAUSE id",  { default => uc $ENV{USER} } ],
+  [ 'githubid=s'   => "your GitHub id", { default =>    $ENV{USER} } ],
+  [ 'local-cpan=s' => "where's your local cpan?", { default =>
+      "$ENV{HOME}/Dropbox/app sync/minicpan/modules/02packages.details.txt.gz" },
+  ]
+);
+
+die "--message without --rebuild or --project is nonsensical"
+  if $opt->message and not ($opt->rebuild or $opt->project);
+
+my $mcpan = MetaCPAN::API->new;
+
+my $saved = YAML::XS::LoadFile('code-review.yaml');
+
+my $p = Parse::CPAN::Packages::Fast->new($opt->local_cpan);
+
+my %is_tracked
+  = map {; $_ => scalar(($saved->{$_}{review} // '') ne 'never') }
+    keys %$saved;
+
+my $dist = {};
+
+my $ua = LWP::UserAgent->new(keep_alive => 5);
+
+DIST: for my $d (
+  sort { fc $a->dist cmp fc $b->dist } $p->latest_distributions
+) {
+  next unless $d->cpanid eq $opt->pauseid;
+  next if $d->dist eq 'perl';
+
+  $dist->{ $d->dist } = $d;
+  $is_tracked{ $d->dist } = 1 unless exists $is_tracked{ $d->dist };
+}
+
+my @projects = sort {
+  ($saved->{$a}{'last-review'} // '0') cmp ($saved->{$b}{'last-review'} // 0)
+  ||
+  fc $a cmp fc $b
+} grep { $is_tracked{$_} } keys %is_tracked;
+
+if (@ARGV) {
+  my @missing = grep {; ! ($is_tracked{$_} or $saved->{$_}) } @ARGV;
+  die "these projects that you asked about are unknown: @missing\n"
+    if @missing;
+  @projects = @ARGV;
+}
+
+if (my $project = $opt->project) {
+  die "project $project is not tracked\n" unless $is_tracked{ $project };
+  $saved->{$project}{'last-review'}
+    = DateTime->now->format_cldr('yyyy-MM-dd');
+}
+
+if ($opt->project or $opt->rebuild) {
+  my %dump = map {; $_ => {
+    ($saved->{$_}{home} ? (home => $saved->{$_}{home}) : ()),
+    ($saved->{$_}{review} ? (review => $saved->{$_}{review}) : ()),
+    ($saved->{$_}{'last-review'}
+    ? ('last-review' => $saved->{$_}{'last-review'})
+    : ()),
+  } } uniq(@projects, keys %$saved);
+
+  YAML::XS::DumpFile('code-review.yaml', \%dump);
+
+  system(qw(git add code-review.yaml)) and die "git-add failed\n";
+  my $message = $opt->message
+             || ($opt->project ? ("did review of " . $opt->project)
+                               : "rebuilt code-review state file");
+
+  open my $mkdn, '>', 'code-review.mkdn' or die "can't open mkdn: $!";
+
+  print {$mkdn} <<END_HEADER;
+This file is computer-generated for humans to read.  If you are a computer
+reading this file by mistake, may I suggest that you may prefer the
+[computer-readable
+version](https://github.com/rjbs/misc/blob/master/code-review.yaml) instead.
+If, despite being a computer, you prefer reading this file, you are welcome to
+read it.  Be advised, though, that its format may change in the future.
+
+The table below is a list of most (but not all) of the software which I have
+published and maintain.  Most of these projects are CPAN distributions.  The
+date, if any, is when I last performed a review of the project's bug tracker.
+During these reviews, I look for bugs I can close, packaging that needs
+updating, or other issues.  A review does not necessarily close all the open
+issues with a project.
+
+Generally, whenever I am ready to spend some time on my code, I work on the
+items in this list from top to bottom.  Once I've worked on an item, it moves
+to the bottom of the list.
+
+You can read [the program that generates this
+file](https://github.com/rjbs/misc/blob/master/code-review) if you like.
+
+| PROJECT NAME                            | LAST REVIEW
+| --------------------------------------- | -------------
+END_HEADER
+
+  printf {$mkdn} "| %-40s| %s\n", $_, $saved->{$_}{'last-review'} // '-'
+    for @projects;
+
+  close $mkdn or die "error closing mkdn: $!";
+
+  system(qw(git add), <code-review.*>) and die "git-add failed\n";
+  system(qw(git commit -m), $message)  and die "git-commit failed\n";
+  exit;
+}
+
+my $did;
+for my $name (@projects) {
+  my @notes = notes_for($name);
+  say "=== $name ==========";
+  printf "    %s\n", $_ for @notes;
+  print  "    Everything is okay!  Who'd have expected THAT?!\n" unless @notes;
+
+  print "...hit enter...";
+  scalar <STDIN> unless $ENV{MAX};
+  last if $ENV{MAX} && ++$did >= $ENV{MAX};
+}
+
+sub notes_for {
+  my ($name) = @_;
+
+  my $home = $saved->{$name}{home} // 'CPAN';
+
+  if ($home eq 'CPAN') {
+    return cpan_notes($name);
+  } elsif ($home eq 'GitHub') {
+    return gh_notes($name);
+  }
+
+  return ("not hosted at CPAN, but at $home");
+}
+
+sub rt_data {
+  state %rt_data;
+  unless (%rt_data) {
+    my $res = $ua->get(
+      'https://rt.cpan.org/Public/bugs-per-dist.json'
+    );
+    die "Can't get RT bug count JSON" unless $res->is_success;
+    my $bug_count = JSON->new->decode($res->decoded_content);
+    for my $name (@projects) {
+      next unless $bug_count->{$name};
+      $rt_data{ $name } = {
+        open    => 0,
+        stalled => 0,
+      };
+
+      $rt_data{ $name }{open} = $bug_count->{$name}{counts}{active}
+                              - $bug_count->{$name}{counts}{stalled};
+
+      $rt_data{ $name }{stalled} = $bug_count->{$name}{counts}{stalled};
+    }
+  }
+
+  return \%rt_data;
+}
+
+sub cpan_notes {
+  my ($name) = @_;
+
+  my $release = eval { $mcpan->release( distribution => $name ) };
+  return ("couldn't find dist on metacpan") unless $release;
+
+  my @notes;
+
+  my $tracker = $release->{resources}{bugtracker};
+  if (! $tracker->{web} or $tracker->{web} =~ /rt.cpan/) {
+    push @notes, "still using rt.cpan.org";
+  }
+
+  my $gh_repo_name = $name;
+
+  my $repo = $release->{resources}{repository}{url};
+  if (! $repo) {
+    push @notes, "no repository on file";
+  } elsif ($repo !~ /github.com/) {
+    push @notes, "not using GitHub for repo";
+  } elsif ($repo =~ /\Q$name/i && $repo !~ /\Q$name/) {
+    $gh_repo_name = lc $name;
+    push @notes, "GitHub repo is not capitalized correctly";
+  }
+
+  push @notes, gh_notes($gh_repo_name);
+
+  my $rt_bugs = rt_data->{$name};
+  for (qw(open stalled)) {
+    push @notes, "rt.cpan.org $_ ticket count: $rt_bugs->{$_}"
+      if $rt_bugs->{$_};
+  }
+
+  unless (($release->{metadata}{generated_by} // '') =~ /Dist::Zilla/) {
+    push @notes, "dist not built with Dist::Zilla";
+  }
+
+  {
+    my $res = $ua->get(
+      "http://cpants.cpanauthors.org/dist/$name.json",
+    );
+
+    if ($res->is_success) {
+      my $data = JSON->new->decode($res->decoded_content);
+      for my $result (@{ $data->{kwalitee}[0] }) {
+        next if $result->{value};
+        next if $result->{is_experimental};
+        next if $result->{is_extra};
+        push @notes, "kwalitee test failed: $result->{name}";
+      }
+    } else {
+      push @notes, "could not get CPANTS results";
+    }
+  }
+
+  return @notes;
+}
+
+sub gh_notes {
+  my ($gh_repo_name) = @_;
+
+  my @notes;
+
+  my $gh_user = $opt->githubid;
+  my $res = $ua->get("https://api.github.com/repos/$gh_user/$gh_repo_name");
+
+  unless ($res->is_success) {
+    return ("Couldn't get repo data for $gh_user/$gh_repo_name from GitHub");
+  }
+
+  my $repo = JSON->new->decode($res->decoded_content);
+
+  push @notes, "GitHub issue count: $repo->{open_issues_count}"
+    if $repo->{open_issues_count};
+
+  return @notes;
+}
