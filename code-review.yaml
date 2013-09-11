@@ -3,7 +3,8 @@ App-otfile:
   last-review: 2013-09-10
 Audio-Analyzer-ToneDetect:
   last-review: 2013-09-09
-Device-RadioThermostat: {}
+Device-RadioThermostat:
+  last-review: 2013-09-11
 File-Compressible:
   last-review: 2013-09-10
 Net-Abuse-Utils:
