@@ -15,12 +15,15 @@ my ($opt, $usage) = describe_options(
   [ 'rebuild'      => "rebuild the YAML file that holds state" ],
   [ 'project|p=s'  => "project to mark reviewed"               ],
   [ 'message|m=s'  => "commit message"                         ],
+  [ 'max|n=s'      => 'number of dists to review'              ],
   [ 'pauseid=s'    => "your PAUSE id",  { default => 'MIKEGRB' } ],
   [ 'githubid=s'   => "your GitHub id", { default => 'mikegrb' } ],
   [ 'local-cpan=s' => "where's your local cpan?", { default =>
       "$ENV{HOME}/Dropbox/app sync/minicpan/modules/02packages.details.txt.gz" },
   ]
 );
+
+$ENV{MAX} //= $opt->max;
 
 die "--message without --rebuild or --project is nonsensical"
   if $opt->message and not ($opt->rebuild or $opt->project);
